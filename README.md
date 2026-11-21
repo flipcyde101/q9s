@@ -7,28 +7,28 @@
 
 ## 15-second demo
 
-[![Q9S inspects a failed webhook job in read-only mode](./docs/media/q9s-poster.png)](./docs/media/q9s-demo.mp4)
+[![Q9S inspects a failed webhook job in read-only mode](./docs/media/q9s-scoped-poster.png)](./docs/media/q9s-scoped-demo.mp4)
 
-[Open the demo video (MP4)](./docs/media/q9s-demo.mp4)
+[Open the demo video (MP4)](./docs/media/q9s-scoped-demo.mp4)
 
 ## Try it in 1 second
 
 Run the self-contained demo (starts a live in-process mock BullMQ Redis TCP server over localhost, talks real RESP2, auto-discovers 3 queues, renders sparklines and the spiking `webhooks` DLQ stack trace, and shuts down cleanly):
 
 ```bash
-npx q9s --demo
+npx @drod915/q9s --demo
 ```
 
 Machine-readable JSON mode:
 
 ```bash
-npx q9s --demo --json
+npx @drod915/q9s --demo --json
 ```
 
 Inspect a specific queue:
 
 ```bash
-npx q9s --demo --inspect billing-sync
+npx @drod915/q9s --demo --inspect billing-sync
 ```
 
 ## Architecture
@@ -71,14 +71,14 @@ flowchart LR
 Requires **Node.js >= 24.0.0**. Postgres backends require `psql` on your `PATH`.
 
 ```bash
-npm install -g q9s
+npm install -g @drod915/q9s
 ```
 
 Or run directly with `npx`:
 
 ```bash
-npx q9s redis://localhost:6379
-npx q9s postgres://app:secret@localhost:5432/mydb
+npx @drod915/q9s redis://localhost:6379
+npx @drod915/q9s postgres://app:secret@localhost:5432/mydb
 ```
 
 ## Named Contexts

@@ -1,5 +1,5 @@
 {
-  "name": "q9s",
+  "name": "@drod915/q9s",
   "version": "0.1.0",
   "description": "k9s for background job queues: terminal dashboard and safe DLQ inspector for BullMQ, River, and pg-boss",
   "type": "module",
