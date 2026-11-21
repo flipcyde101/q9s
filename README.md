@@ -5,6 +5,12 @@
 > [!IMPORTANT]
 > **Read-only by default (`--read-only`).** `q9s` refuses all mutations unless you explicitly pass `--allow-write`. Bulk retries additionally require `--yes`. Passwords in Redis/Postgres URLs and named contexts are always redacted in terminal and JSON output.
 
+## 15-second demo
+
+[![Q9S inspects a failed webhook job in read-only mode](./docs/media/q9s-poster.png)](./docs/media/q9s-demo.mp4)
+
+[Open the demo video (MP4)](./docs/media/q9s-demo.mp4)
+
 ## Try it in 1 second
 
 Run the self-contained demo (starts a live in-process mock BullMQ Redis TCP server over localhost, talks real RESP2, auto-discovers 3 queues, renders sparklines and the spiking `webhooks` DLQ stack trace, and shuts down cleanly):
