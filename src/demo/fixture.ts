@@ -30,13 +30,17 @@ function createEmptyStore(): RedisStore {
   };
 }
 
+function sanitizeRespLine(text: string): string {
+  return text.replace(/[\r\n]+/g, " ");
+}
+
 function encodeRespReply(value: RespValue | { error: string } | { simple: string }): Buffer {
   if (value !== null && typeof value === "object" && !Array.isArray(value)) {
     if ("error" in value) {
-      return Buffer.from(`-${value.error}\r\n`, "utf8");
+      return Buffer.from(`-${sanitizeRespLine(value.error)}\r\n`, "utf8");
     }
     if ("simple" in value) {
-      return Buffer.from(`+${value.simple}\r\n`, "utf8");
+      return Buffer.from(`+${sanitizeRespLine(value.simple)}\r\n`, "utf8");
     }
   }
 
@@ -583,6 +587,10 @@ function executeCommand(
       }
       return removed;
     }
+
+    case "WATCH":
+    case "UNWATCH":
+      return { simple: "OK" };
 
     default:
       return { error: `ERR unknown command '${cmd}'` };

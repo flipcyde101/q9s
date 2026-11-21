@@ -157,14 +157,16 @@ Contexts marked `"readOnly": true` in config refuse `--allow-write` even if pass
 | `--backend <kind>` | Override auto-detection: `bullmq`, `river`, or `pg-boss` |
 | `--prefix <prefix>` | BullMQ Redis key prefix (default: `bull`) |
 | `--schema <schema>` | Postgres schema override (default: auto-detected) |
+| `--timeout <ms>` | Connection/query timeout in ms (default: `5000`) |
 | `--inspect <queue>` | Inspect jobs in a specific queue (default: queue with most failed jobs) |
 | `--state <state>` | Job state: `waiting`, `active`, `delayed`, `completed`, `failed` (default: `failed`) |
 | `--limit <n>` | Max jobs to inspect (default: `3`) or bulk-retry (default: `100`) |
 | `--read-only` | Enforce read-only mode (default: `true`) |
 | `--allow-write` | Explicitly allow `--retry` and `--retry-failed` mutations |
 | `--retry <jobId>` | Retry one failed job (requires `--queue`/`--inspect` and `--allow-write`) |
+| `--queue <queue>` | Target queue for `--retry` |
 | `--retry-failed <queue>` | Bulk retry failed jobs in `<queue>` (requires `--allow-write` and `--yes`) |
-| `--yes` | Confirm bulk write action |
+| `-y`, `--yes` | Confirm bulk write action |
 | `--json` | Emit structured JSON |
 | `--no-color` | Disable ANSI colors |
 | `-h`, `--help` | Show CLI usage |

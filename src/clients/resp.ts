@@ -1,7 +1,8 @@
 import net from "node:net";
 import tls from "node:tls";
+import { redactUrl } from "../config/contexts.js";
 
-export type RespValue = string | number | null | RespValue[];
+export type RespValue = string | number | null | RespError | RespValue[];
 
 export class RespError extends Error {
   readonly code = "RESP_SERVER_ERROR";
@@ -52,21 +53,46 @@ interface PendingCommand {
 }
 
 const CRLF = Buffer.from("\r\n", "utf8");
+const STRICT_INT_RE = /^-?\d+$/;
+const STRICT_UINT_RE = /^\d+$/;
+const MAX_RESP_DEPTH = 32;
+const MAX_RESP_BULK_BYTES = 16 * 1024 * 1024;
+const MAX_RESP_ARRAY_LEN = 100_000;
+const MAX_RESP_BUFFER_BYTES = 32 * 1024 * 1024;
+
+function parseStrictInt(line: string, label: string): number {
+  if (!STRICT_INT_RE.test(line)) {
+    throw new RespProtocolError(`Invalid RESP ${label}: "${line}"`);
+  }
+  const num = Number(line);
+  if (!Number.isSafeInteger(num)) {
+    throw new RespProtocolError(`Out-of-range RESP ${label}: "${line}"`);
+  }
+  return num;
+}
 
 export function parseRedisUrl(rawUrl: string): ParsedRedisUrl {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
   } catch {
-    throw new Error(`Invalid Redis URL: ${rawUrl}`);
+    throw new Error(`Invalid Redis URL: ${redactUrl(rawUrl)}`);
   }
 
   if (parsed.protocol !== "redis:" && parsed.protocol !== "rediss:") {
     throw new Error(`Unsupported Redis protocol "${parsed.protocol}". Expected redis:// or rediss://`);
   }
 
-  const host = parsed.hostname || "127.0.0.1";
-  const port = parsed.port ? Number.parseInt(parsed.port, 10) : 6379;
+  const rawHost = parsed.hostname || "127.0.0.1";
+  const host = rawHost.startsWith("[") && rawHost.endsWith("]") ? rawHost.slice(1, -1) : rawHost;
+
+  let port = 6379;
+  if (parsed.port) {
+    if (!STRICT_UINT_RE.test(parsed.port)) {
+      throw new Error(`Invalid Redis port: ${parsed.port}`);
+    }
+    port = Number(parsed.port);
+  }
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`Invalid Redis port: ${parsed.port}`);
   }
@@ -77,8 +103,11 @@ export function parseRedisUrl(rawUrl: string): ParsedRedisUrl {
   let db = 0;
   const trimmedPath = parsed.pathname.replace(/^\/+/, "");
   if (trimmedPath.length > 0) {
-    const parsedDb = Number.parseInt(trimmedPath, 10);
-    if (!Number.isInteger(parsedDb) || parsedDb < 0) {
+    if (!STRICT_UINT_RE.test(trimmedPath)) {
+      throw new Error(`Invalid Redis database index: ${trimmedPath}`);
+    }
+    const parsedDb = Number(trimmedPath);
+    if (!Number.isSafeInteger(parsedDb) || parsedDb < 0) {
       throw new Error(`Invalid Redis database index: ${trimmedPath}`);
     }
     db = parsedDb;
@@ -119,7 +148,10 @@ function findCrlf(buf: Buffer, offset: number): number {
   return -1;
 }
 
-export function parseRespFrame(buf: Buffer, offset = 0): ParsedFrame | null {
+export function parseRespFrame(buf: Buffer, offset = 0, depth = 0): ParsedFrame | null {
+  if (depth > MAX_RESP_DEPTH) {
+    throw new RespProtocolError(`RESP nesting depth exceeded maximum of ${MAX_RESP_DEPTH}`);
+  }
   if (offset >= buf.length) {
     return null;
   }
@@ -141,23 +173,20 @@ export function parseRespFrame(buf: Buffer, offset = 0): ParsedFrame | null {
       return { value: new RespError(line), nextOffset: afterLine };
 
     case 0x3a: { // ':' Integer
-      const num = Number.parseInt(line, 10);
-      if (Number.isNaN(num)) {
-        throw new RespProtocolError(`Invalid RESP integer: "${line}"`);
-      }
+      const num = parseStrictInt(line, "integer");
       return { value: num, nextOffset: afterLine };
     }
 
     case 0x24: { // '$' Bulk String
-      const byteLength = Number.parseInt(line, 10);
-      if (Number.isNaN(byteLength)) {
-        throw new RespProtocolError(`Invalid RESP bulk length: "${line}"`);
-      }
+      const byteLength = parseStrictInt(line, "bulk length");
       if (byteLength === -1) {
         return { value: null, nextOffset: afterLine };
       }
       if (byteLength < 0) {
         throw new RespProtocolError(`Invalid negative RESP bulk length: ${byteLength}`);
+      }
+      if (byteLength > MAX_RESP_BULK_BYTES) {
+        throw new RespProtocolError(`RESP bulk length ${byteLength} exceeds limit of ${MAX_RESP_BULK_BYTES} bytes`);
       }
       const payloadEnd = afterLine + byteLength;
       if (buf.length < payloadEnd + 2) {
@@ -171,28 +200,24 @@ export function parseRespFrame(buf: Buffer, offset = 0): ParsedFrame | null {
     }
 
     case 0x2a: { // '*' Array
-      const count = Number.parseInt(line, 10);
-      if (Number.isNaN(count)) {
-        throw new RespProtocolError(`Invalid RESP array length: "${line}"`);
-      }
+      const count = parseStrictInt(line, "array length");
       if (count === -1) {
         return { value: null, nextOffset: afterLine };
       }
       if (count < 0) {
         throw new RespProtocolError(`Invalid negative RESP array length: ${count}`);
       }
+      if (count > MAX_RESP_ARRAY_LEN) {
+        throw new RespProtocolError(`RESP array length ${count} exceeds limit of ${MAX_RESP_ARRAY_LEN}`);
+      }
       const items: RespValue[] = [];
       let cursor = afterLine;
       for (let i = 0; i < count; i++) {
-        const elem = parseRespFrame(buf, cursor);
+        const elem = parseRespFrame(buf, cursor, depth + 1);
         if (!elem) {
           return null;
         }
-        if (elem.value instanceof RespError) {
-          items.push(elem.value.message);
-        } else {
-          items.push(elem.value);
-        }
+        items.push(elem.value);
         cursor = elem.nextOffset;
       }
       return { value: items, nextOffset: cursor };
@@ -209,12 +234,16 @@ export class RespParser {
   private buffer: Buffer = Buffer.alloc(0);
 
   push(chunk: Buffer): Array<RespValue | RespError> {
+    if (this.buffer.length + chunk.length > MAX_RESP_BUFFER_BYTES) {
+      this.buffer = Buffer.alloc(0);
+      throw new RespProtocolError(`RESP parser buffer exceeded ${MAX_RESP_BUFFER_BYTES} bytes`);
+    }
     this.buffer = this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk]);
     const frames: Array<RespValue | RespError> = [];
 
     let offset = 0;
     while (offset < this.buffer.length) {
-      const parsed = parseRespFrame(this.buffer, offset);
+      const parsed = parseRespFrame(this.buffer, offset, 0);
       if (!parsed) {
         break;
       }
@@ -262,12 +291,14 @@ export class RespClient {
         }
       } catch (err) {
         const protocolErr = err instanceof Error ? err : new Error(String(err));
+        this.closed = true;
         this.failAllPending(protocolErr);
         this.socket.destroy(protocolErr);
       }
     });
 
     this.socket.on("error", (err: Error) => {
+      this.closed = true;
       this.failAllPending(err);
     });
 
@@ -275,6 +306,8 @@ export class RespClient {
       this.closed = true;
       this.failAllPending(new Error("Redis connection closed"));
     });
+
+    this.socket.resume();
   }
 
   static async connect(
@@ -284,37 +317,9 @@ export class RespClient {
     const config = typeof target === "string" ? parseRedisUrl(target) : target;
     const timeoutMs = options.timeoutMs ?? 5000;
 
-    const socket = await new Promise<net.Socket>((resolve, reject) => {
+    const client = await new Promise<RespClient>((resolve, reject) => {
       let settled = false;
-      const timer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          sock.destroy();
-          reject(
-            new RespTimeoutError(
-              `Timed out connecting to Redis at ${config.host}:${config.port} after ${timeoutMs}ms`,
-            ),
-          );
-        }
-      }, timeoutMs);
-
-      const onConnect = () => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          sock.setNoDelay(true);
-          sock.removeListener("error", onError);
-          resolve(sock);
-        }
-      };
-
-      const onError = (err: Error) => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          reject(err);
-        }
-      };
+      const connectEvent = config.tls ? "secureConnect" : "connect";
 
       const sock: net.Socket = config.tls
         ? tls.connect({
@@ -328,11 +333,57 @@ export class RespClient {
             port: config.port,
           });
 
-      sock.once(config.tls ? "secureConnect" : "connect", onConnect);
-      sock.once("error", onError);
-    });
+      const cleanup = () => {
+        clearTimeout(timer);
+        sock.removeListener(connectEvent, onConnect);
+        sock.removeListener("error", onError);
+        sock.removeListener("close", onClose);
+      };
 
-    const client = new RespClient(socket, timeoutMs);
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          sock.destroy();
+          reject(
+            new RespTimeoutError(
+              `Timed out connecting to Redis at ${config.host}:${config.port} after ${timeoutMs}ms`,
+            ),
+          );
+        }
+      }, timeoutMs);
+
+      const onConnect = () => {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          sock.pause();
+          sock.setNoDelay(true);
+          resolve(new RespClient(sock, timeoutMs));
+        }
+      };
+
+      const onError = (err: Error) => {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          sock.destroy();
+          reject(err);
+        }
+      };
+
+      const onClose = () => {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          reject(new Error(`Redis connection closed during handshake (${config.host}:${config.port})`));
+        }
+      };
+
+      sock.once(connectEvent, onConnect);
+      sock.once("error", onError);
+      sock.once("close", onClose);
+    });
 
     try {
       if (config.password !== undefined) {
@@ -363,11 +414,13 @@ export class RespClient {
 
     return new Promise<RespValue>((resolve, reject) => {
       const timer = setTimeout(() => {
-        const idx = this.pending.indexOf(entry);
-        if (idx !== -1) {
-          this.pending.splice(idx, 1);
-        }
-        reject(new RespTimeoutError(`Redis command ${cmdName} timed out after ${this.timeoutMs}ms`));
+        // Destroy the connection on timeout so a late reply can never desync the FIFO pipeline.
+        const timeoutErr = new RespTimeoutError(
+          `Redis command ${cmdName} timed out after ${this.timeoutMs}ms`,
+        );
+        this.closed = true;
+        this.failAllPending(timeoutErr);
+        this.socket.destroy(timeoutErr);
       }, this.timeoutMs);
 
       const entry: PendingCommand = { resolve, reject, timer };
@@ -428,6 +481,12 @@ export class RespClient {
       iterations++;
     } while (cursor !== "0" && iterations < maxIterations);
 
+    if (cursor !== "0") {
+      throw new RespProtocolError(
+        `SCAN exceeded ${maxIterations} iterations without completing (pattern: ${pattern})`,
+      );
+    }
+
     return Array.from(seen).sort();
   }
 
@@ -477,6 +536,9 @@ export class RespClient {
 
   async close(): Promise<void> {
     if (this.closed) {
+      if (!this.socket.destroyed) {
+        this.socket.destroy();
+      }
       return;
     }
     this.closed = true;

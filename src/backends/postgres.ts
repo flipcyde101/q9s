@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { redactUrl } from "../config/contexts.js";
 import {
   type BackendOptions,
   type JobRecord,
@@ -12,6 +13,7 @@ import {
 export type PostgresQueueKind = "river" | "pg-boss";
 
 export const PSQL_FIELD_SEPARATOR = "\x1f";
+const PSQL_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
 
 export interface ParsedPostgresUrl {
   sanitizedUrl: string;
@@ -34,13 +36,19 @@ const IDENTIFIER_RE = /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/;
 const QUEUE_NAME_RE = /^[a-zA-Z0-9_.:/@-]{1,128}$/;
 const RIVER_ID_RE = /^[0-9]{1,20}$/;
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const STRIPPED_PG_QUERY_KEYS = new Set(["password", "pass", "passwd", "pwd", "options"]);
+
+function clampLimit(limit: number, fallback: number, max: number): number {
+  const n = Number.isFinite(limit) ? Math.trunc(limit) : fallback;
+  return Math.max(1, Math.min(n, max));
+}
 
 export function parsePostgresUrl(rawUrl: string): ParsedPostgresUrl {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
   } catch {
-    throw new Error(`Invalid Postgres URL: ${rawUrl}`);
+    throw new Error(`Invalid Postgres URL: ${redactUrl(rawUrl)}`);
   }
 
   if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
@@ -49,18 +57,33 @@ export function parsePostgresUrl(rawUrl: string): ParsedPostgresUrl {
     );
   }
 
-  const host = parsed.hostname || "127.0.0.1";
+  const rawHost = parsed.hostname || "127.0.0.1";
+  const host = rawHost.startsWith("[") && rawHost.endsWith("]") ? rawHost.slice(1, -1) : rawHost;
   const port = parsed.port ? Number.parseInt(parsed.port, 10) : 5432;
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`Invalid Postgres port: ${parsed.port}`);
   }
 
   const username = parsed.username ? decodeURIComponent(parsed.username) : undefined;
-  const password = parsed.password ? decodeURIComponent(parsed.password) : undefined;
+  let password = parsed.password ? decodeURIComponent(parsed.password) : undefined;
   const database = parsed.pathname.replace(/^\/+/, "") || "postgres";
 
   const sanitized = new URL(parsed.toString());
   sanitized.password = "";
+
+  // Extract ?password= into PGPASSWORD and strip sensitive / read-only-bypassing query keys (options=)
+  for (const key of Array.from(sanitized.searchParams.keys())) {
+    const lower = key.toLowerCase();
+    if (lower === "password" && password === undefined) {
+      const val = sanitized.searchParams.get(key);
+      if (val !== null) {
+        password = val;
+      }
+    }
+    if (STRIPPED_PG_QUERY_KEYS.has(lower)) {
+      sanitized.searchParams.delete(key);
+    }
+  }
 
   return {
     sanitizedUrl: sanitized.toString(),
@@ -120,6 +143,14 @@ function parseIntField(raw: string | undefined): number {
   }
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) ? n : 0;
+}
+
+function parseOptionalIntField(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw.trim() === "") {
+    return undefined;
+  }
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) ? n : undefined;
 }
 
 function parseTimestampMs(raw: string | undefined): number | undefined {
@@ -252,7 +283,7 @@ export function buildRiverJobsSql(
 ): string {
   const s = validateIdentifier(schema, "schema");
   const q = validateQueueName(queue);
-  const safeLimit = Math.max(1, Math.min(Math.trunc(limit), 500));
+  const safeLimit = clampLimit(limit, 25, 500);
   const statesList = riverStatesFor(state).map(sqlLiteral).join(", ");
 
   return [
@@ -335,7 +366,7 @@ export function parseRiverJobs(output: string, queue: string): JobRecord[] {
       failedReason,
       stacktrace,
       attemptsMade: parseIntField(cols[5]),
-      maxAttempts: parseIntField(cols[6]) || undefined,
+      maxAttempts: parseOptionalIntField(cols[6]),
       timestamp: parseTimestampMs(cols[7]),
       processedOn: parseTimestampMs(cols[8]),
       finishedOn: parseTimestampMs(cols[9]),
@@ -350,7 +381,7 @@ export function buildRiverRetryJobSql(schema: string, queue: string, jobId: stri
 
   return [
     `UPDATE "${s}"."river_job"`,
-    "SET state = 'available', scheduled_at = NOW(), finalized_at = NULL",
+    "SET state = 'available', scheduled_at = NOW(), finalized_at = NULL, max_attempts = CASE WHEN max_attempts <= attempt THEN LEAST(attempt + 1, 32767) ELSE max_attempts END",
     `WHERE queue = ${sqlLiteral(q)} AND id = ${id} AND state IN ('discarded', 'cancelled')`,
     "RETURNING id::text;",
   ].join(" ");
@@ -359,7 +390,7 @@ export function buildRiverRetryJobSql(schema: string, queue: string, jobId: stri
 export function buildRiverRetryFailedBulkSql(schema: string, queue: string, limit = 100): string {
   const s = validateIdentifier(schema, "schema");
   const q = validateQueueName(queue);
-  const safeLimit = Math.max(1, Math.min(Math.trunc(limit), 1000));
+  const safeLimit = clampLimit(limit, 100, 1000);
 
   return [
     "WITH target AS (",
@@ -370,7 +401,7 @@ export function buildRiverRetryFailedBulkSql(schema: string, queue: string, limi
     "  FOR UPDATE SKIP LOCKED",
     ")",
     `UPDATE "${s}"."river_job" r`,
-    "SET state = 'available', scheduled_at = NOW(), finalized_at = NULL",
+    "SET state = 'available', scheduled_at = NOW(), finalized_at = NULL, max_attempts = CASE WHEN max_attempts <= attempt THEN LEAST(attempt + 1, 32767) ELSE max_attempts END",
     "FROM target",
     "WHERE r.id = target.id",
     "RETURNING r.id::text;",
@@ -386,7 +417,7 @@ export function buildPgBossQueueStatsSql(schema = "pgboss"): string {
     "  COUNT(*) FILTER (WHERE state = 'active') AS active,",
     "  COUNT(*) FILTER (WHERE (state = 'created' AND start_after > NOW()) OR state = 'retry') AS delayed,",
     "  COUNT(*) FILTER (WHERE state = 'completed') AS completed,",
-    "  COUNT(*) FILTER (WHERE state IN ('failed', 'expired', 'cancelled')) AS failed",
+    "  COUNT(*) FILTER (WHERE state IN ('failed', 'cancelled')) AS failed",
     `FROM "${s}"."job"`,
     "GROUP BY name",
     "ORDER BY name ASC;",
@@ -424,7 +455,7 @@ function pgBossWhereForState(state: JobState): string {
     case "completed":
       return "state = 'completed'";
     case "failed":
-      return "state IN ('failed', 'expired', 'cancelled')";
+      return "state IN ('failed', 'cancelled')";
   }
 }
 
@@ -437,7 +468,6 @@ function mapPgBossStateToJobState(rawState: string): JobState {
     case "completed":
       return "completed";
     case "failed":
-    case "expired":
     case "cancelled":
       return "failed";
     default:
@@ -453,7 +483,7 @@ export function buildPgBossJobsSql(
 ): string {
   const s = validateIdentifier(schema, "schema");
   const q = validateQueueName(queue);
-  const safeLimit = Math.max(1, Math.min(Math.trunc(limit), 500));
+  const safeLimit = clampLimit(limit, 25, 500);
 
   return [
     "SELECT",
@@ -537,7 +567,7 @@ export function parsePgBossJobs(output: string, queue: string): JobRecord[] {
       failedReason,
       stacktrace,
       attemptsMade: parseIntField(cols[5]),
-      maxAttempts: parseIntField(cols[6]) || undefined,
+      maxAttempts: parseOptionalIntField(cols[6]),
       timestamp: parseTimestampMs(cols[7]),
       processedOn: parseTimestampMs(cols[8]),
       finishedOn: parseTimestampMs(cols[9]),
@@ -552,8 +582,8 @@ export function buildPgBossRetryJobSql(schema: string, queue: string, jobId: str
 
   return [
     `UPDATE "${s}"."job"`,
-    "SET state = 'created', retry_count = 0, completed_on = NULL, start_after = NOW()",
-    `WHERE name = ${sqlLiteral(q)} AND id = ${sqlLiteral(id)} AND state IN ('failed', 'expired', 'cancelled')`,
+    "SET state = 'created', retry_count = 0, started_on = NULL, completed_on = NULL, output = NULL, start_after = NOW()",
+    `WHERE name = ${sqlLiteral(q)} AND id = ${sqlLiteral(id)} AND state IN ('failed', 'cancelled')`,
     "RETURNING id::text;",
   ].join(" ");
 }
@@ -561,20 +591,20 @@ export function buildPgBossRetryJobSql(schema: string, queue: string, jobId: str
 export function buildPgBossRetryFailedBulkSql(schema: string, queue: string, limit = 100): string {
   const s = validateIdentifier(schema, "schema");
   const q = validateQueueName(queue);
-  const safeLimit = Math.max(1, Math.min(Math.trunc(limit), 1000));
+  const safeLimit = clampLimit(limit, 100, 1000);
 
   return [
     "WITH target AS (",
     `  SELECT id FROM "${s}"."job"`,
-    `  WHERE name = ${sqlLiteral(q)} AND state IN ('failed', 'expired', 'cancelled')`,
+    `  WHERE name = ${sqlLiteral(q)} AND state IN ('failed', 'cancelled')`,
     "  ORDER BY created_on ASC",
     `  LIMIT ${safeLimit}`,
     "  FOR UPDATE SKIP LOCKED",
     ")",
     `UPDATE "${s}"."job" j`,
-    "SET state = 'created', retry_count = 0, completed_on = NULL, start_after = NOW()",
+    "SET state = 'created', retry_count = 0, started_on = NULL, completed_on = NULL, output = NULL, start_after = NOW()",
     "FROM target",
-    "WHERE j.id = target.id",
+    `WHERE j.id = target.id AND j.name = ${sqlLiteral(q)}`,
     "RETURNING j.id::text;",
   ].join(" ");
 }
@@ -601,7 +631,8 @@ export class PostgresQueueBackend implements QueueBackend {
   ) {
     this.kind = kind;
     this.schema = validateIdentifier(schema, "schema");
-    this.readOnly = readOnly;
+    // Fail closed if readOnly is omitted at runtime by non-TS callers
+    this.readOnly = readOnly !== false;
     this.runner = runner;
   }
 
@@ -622,6 +653,10 @@ export class PostgresQueueBackend implements QueueBackend {
           env.PGOPTIONS = `${existing}-c default_transaction_read_only=on`;
         }
 
+        const effectiveSql = readOnly
+          ? `BEGIN TRANSACTION READ ONLY; ${sql} COMMIT;`
+          : sql;
+
         const args = [
           "-X",
           "-A",
@@ -633,15 +668,26 @@ export class PostgresQueueBackend implements QueueBackend {
           "-d",
           parsed.sanitizedUrl,
           "-c",
-          sql,
+          effectiveSql,
         ];
 
-        return execFileSync(psqlPath, args, {
-          env,
-          encoding: "utf8",
-          timeout: timeoutMs,
-          stdio: ["ignore", "pipe", "pipe"],
-        });
+        try {
+          return execFileSync(psqlPath, args, {
+            env,
+            encoding: "utf8",
+            timeout: timeoutMs,
+            maxBuffer: PSQL_MAX_BUFFER_BYTES,
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+        } catch (err) {
+          const stderr =
+            err && typeof err === "object" && "stderr" in err && typeof err.stderr === "string"
+              ? err.stderr.trim()
+              : err instanceof Error
+                ? err.message
+                : String(err);
+          throw new Error(`psql query failed on ${redactUrl(url)}: ${stderr || "unknown error"}`);
+        }
       });
 
     let kind = options.kind;

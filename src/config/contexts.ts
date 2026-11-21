@@ -19,10 +19,7 @@ const SENSITIVE_QUERY_KEYS = new Set([
 export function redactUrl(rawUrl: string): string {
   try {
     const parsed = new URL(rawUrl);
-    let hasRedactedPassword = false;
-    if (parsed.password) {
-      hasRedactedPassword = true;
-    }
+    const hasRedactedPassword = parsed.password.length > 0;
 
     const searchParams = new URLSearchParams(parsed.search);
     let modifiedQuery = false;
@@ -51,7 +48,12 @@ export function redactUrl(rawUrl: string): string {
     const queryStr = modifiedQuery ? `?${searchParams.toString()}` : parsed.search;
     return `${protocol}//${authPart}${hostPart}${parsed.pathname}${queryStr}`;
   } catch {
-    return rawUrl.replace(/(:\/\/[^:@/\s]*:)([^@/\s]+)(@)/g, "$1***$3");
+    let redacted = rawUrl.replace(/(:\/\/[^:@/?#\s]*:)([^/?#]+)(@)/g, "$1***$3");
+    redacted = redacted.replace(
+      /([?&](?:password|pass|passwd|pwd|token|secret|apikey|api_key|auth)=)([^&#\s]*)/gi,
+      "$1***",
+    );
+    return redacted;
   }
 }
 
@@ -60,6 +62,24 @@ export function redactContext(ctx: ContextEntry): ContextEntry {
     ...ctx,
     url: redactUrl(ctx.url),
   };
+}
+
+function stripInlineYamlComment(raw: string): string {
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+    } else if (ch === '"' && !inSingle && raw[i - 1] !== "\\") {
+      inDouble = !inDouble;
+    } else if (ch === "#" && !inSingle && !inDouble) {
+      if (i === 0 || /\s/.test(raw[i - 1]!)) {
+        return raw.slice(0, i);
+      }
+    }
+  }
+  return raw;
 }
 
 function unquoteYamlValue(raw: string): string {
@@ -73,25 +93,35 @@ function unquoteYamlValue(raw: string): string {
   return trimmed;
 }
 
-function parseBool(raw: unknown): boolean | undefined {
+function parseBool(raw: unknown, fieldName = "readOnly"): boolean | undefined {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
   if (typeof raw === "boolean") {
     return raw;
   }
   if (typeof raw === "string") {
     const lower = raw.trim().toLowerCase();
+    if (lower === "") {
+      return undefined;
+    }
     if (lower === "true" || lower === "yes" || lower === "1") {
       return true;
     }
     if (lower === "false" || lower === "no" || lower === "0") {
       return false;
     }
+    throw new Error(`Invalid boolean value "${raw}" for "${fieldName}" in contexts config.`);
   }
-  return undefined;
+  throw new Error(`Invalid boolean value for "${fieldName}" in contexts config.`);
 }
 
 function normalizeBackend(raw: unknown): QueueBackendKind | undefined {
-  if (typeof raw !== "string") {
+  if (raw === undefined || raw === null || raw === "") {
     return undefined;
+  }
+  if (typeof raw !== "string") {
+    throw new Error(`Invalid backend in contexts config. Expected bullmq, river, or pg-boss.`);
   }
   const normalized = raw.trim().toLowerCase() as QueueBackendKind;
   if (!VALID_BACKENDS.has(normalized)) {
@@ -110,7 +140,7 @@ function normalizeEntry(name: string, obj: Record<string, unknown>): ContextEntr
     name,
     url,
     backend: normalizeBackend(obj.backend),
-    readOnly: parseBool(obj.readOnly ?? obj.read_only),
+    readOnly: parseBool(obj.readOnly ?? obj.read_only, "readOnly"),
     prefix: typeof obj.prefix === "string" && obj.prefix.trim() ? obj.prefix.trim() : undefined,
     schema: typeof obj.schema === "string" && obj.schema.trim() ? obj.schema.trim() : undefined,
   };
@@ -121,11 +151,12 @@ export function parseSimpleYamlContexts(content: string): ContextEntry[] {
   const entries = new Map<string, Record<string, string>>();
 
   let insideContextsRoot = false;
+  let ignoreCurrentTopSection = false;
   let currentName: string | null = null;
   let contextIndent: number | null = null;
 
   for (const rawLine of lines) {
-    const withoutComment = rawLine.replace(/^\s*#.*$/, "");
+    const withoutComment = stripInlineYamlComment(rawLine);
     if (withoutComment.trim().length === 0) {
       continue;
     }
@@ -135,8 +166,21 @@ export function parseSimpleYamlContexts(content: string): ContextEntry[] {
 
     if (indent === 0 && trimmed === "contexts:") {
       insideContextsRoot = true;
+      ignoreCurrentTopSection = false;
       currentName = null;
       contextIndent = null;
+      continue;
+    }
+
+    if (indent === 0 && insideContextsRoot) {
+      insideContextsRoot = false;
+      ignoreCurrentTopSection = true;
+      currentName = null;
+      contextIndent = null;
+      continue;
+    }
+
+    if (ignoreCurrentTopSection) {
       continue;
     }
 
@@ -254,7 +298,8 @@ export function loadContexts(explicitPath?: string): ContextEntry[] {
   }
 
   const content = fs.readFileSync(filePath, "utf8");
-  if (filePath.endsWith(".yaml") || filePath.endsWith(".yml")) {
+  const lowerPath = filePath.toLowerCase();
+  if (lowerPath.endsWith(".yaml") || lowerPath.endsWith(".yml")) {
     return parseSimpleYamlContexts(content);
   }
   return parseJsonContexts(content);

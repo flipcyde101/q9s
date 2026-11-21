@@ -1,4 +1,4 @@
-import { RespClient } from "../clients/resp.js";
+import { RespClient, RespError } from "../clients/resp.js";
 import {
   type BackendOptions,
   type JobRecord,
@@ -33,6 +33,15 @@ function parseOptionalInt(raw: string | undefined): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function clampLimit(limit: number, fallback: number, max: number): number {
+  const n = Number.isFinite(limit) ? Math.trunc(limit) : fallback;
+  return Math.max(1, Math.min(n, max));
+}
+
+function escapeRedisGlob(value: string): string {
+  return value.replace(/([*?[\]\\])/g, "\\$1");
+}
+
 function parseStacktrace(raw: string | undefined): string[] | undefined {
   if (!raw) {
     return undefined;
@@ -57,7 +66,14 @@ export function extractQueueNameFromKey(key: string, prefix: string, suffix: str
     return null;
   }
   const inner = key.slice(head.length, key.length - tail.length);
-  return inner.length > 0 ? inner : null;
+  if (inner.length === 0) {
+    return null;
+  }
+  // Ignore BullMQ internal sub-namespaces like bull:<queue>:metrics:failed or :repeat
+  if (inner.endsWith(":metrics") || inner.endsWith(":repeat")) {
+    return null;
+  }
+  return inner;
 }
 
 export function parseBullMqJobHash(
@@ -106,8 +122,13 @@ export class BullMqBackend implements QueueBackend {
   private constructor(client: RespClient, ownsClient: boolean, options: BullMqBackendOptions) {
     this.client = client;
     this.ownsClient = ownsClient;
-    this.readOnly = options.readOnly;
-    this.prefix = (options.prefix ?? "bull").replace(/:+$/, "");
+    // Fail closed if readOnly is omitted at runtime by non-TS callers
+    this.readOnly = options.readOnly !== false;
+    const cleanedPrefix = (options.prefix ?? "bull").replace(/:+$/, "").trim();
+    if (!cleanedPrefix) {
+      throw new Error("BullMQ prefix cannot be empty.");
+    }
+    this.prefix = cleanedPrefix;
   }
 
   static async connect(url: string, options: BullMqBackendOptions): Promise<BullMqBackend> {
@@ -132,9 +153,10 @@ export class BullMqBackend implements QueueBackend {
   async discoverQueues(): Promise<string[]> {
     const queueNames = new Set<string>();
     const suffixes = ["meta", "id", "failed"] as const;
+    const escapedPrefix = escapeRedisGlob(this.prefix);
 
     for (const suffix of suffixes) {
-      const keys = await this.client.scanAll(`${this.prefix}:*:${suffix}`);
+      const keys = await this.client.scanAll(`${escapedPrefix}:*:${suffix}`);
       for (const fullKey of keys) {
         const name = extractQueueNameFromKey(fullKey, this.prefix, suffix);
         if (name) {
@@ -195,7 +217,7 @@ export class BullMqBackend implements QueueBackend {
   }
 
   async listJobs(queue: string, state: JobState, limit = 25): Promise<JobRecord[]> {
-    const safeLimit = Math.max(1, Math.min(limit, 500));
+    const safeLimit = clampLimit(limit, 25, 500);
     const stop = safeLimit - 1;
 
     let ids: string[];
@@ -209,9 +231,20 @@ export class BullMqBackend implements QueueBackend {
       case "delayed":
         ids = await this.client.zrange(this.key(queue, "delayed"), 0, stop);
         break;
-      case "waiting":
-        ids = await this.client.lrange(this.key(queue, "wait"), 0, stop);
+      case "waiting": {
+        const [waitIds, pausedIds, prioIds] = await Promise.all([
+          this.client.lrange(this.key(queue, "wait"), 0, stop),
+          this.client.lrange(this.key(queue, "paused"), 0, stop),
+          this.client.zrange(this.key(queue, "prioritized"), 0, stop),
+        ]);
+        const merged = new Set<string>();
+        for (const id of [...waitIds, ...pausedIds, ...prioIds]) {
+          merged.add(id);
+          if (merged.size >= safeLimit) break;
+        }
+        ids = Array.from(merged);
         break;
+      }
       case "active":
         ids = await this.client.lrange(this.key(queue, "active"), 0, stop);
         break;
@@ -261,52 +294,25 @@ export class BullMqBackend implements QueueBackend {
     }
 
     const failedKey = this.key(queue, "failed");
-    const score = await this.client.command("ZSCORE", failedKey, jobId);
-    if (score === null) {
-      return { queue, retried: 0, jobIds: [] };
-    }
+    const metaKey = this.key(queue, "meta");
 
-    const jobKey = this.key(queue, jobId);
-    const waitKey = this.key(queue, "wait");
+    await this.client.command("WATCH", failedKey, metaKey);
+    let inTx = false;
+    try {
+      const [score, pausedMeta] = await Promise.all([
+        this.client.command("ZSCORE", failedKey, jobId),
+        this.client.hget(metaKey, "paused"),
+      ]);
+      if (score === null) {
+        await this.client.command("UNWATCH");
+        return { queue, retried: 0, jobIds: [] };
+      }
 
-    await this.client.command("MULTI");
-    await this.client.command("ZREM", failedKey, jobId);
-    await this.client.command(
-      "HDEL",
-      jobKey,
-      "failedReason",
-      "stacktrace",
-      "processedOn",
-      "finishedOn",
-      "returnvalue",
-    );
-    await this.client.command("RPUSH", waitKey, jobId);
-    const execRes = await this.client.command("EXEC");
-
-    if (execRes === null) {
-      return { queue, retried: 0, jobIds: [] };
-    }
-
-    return { queue, retried: 1, jobIds: [jobId] };
-  }
-
-  async retryFailedBulk(queue: string, limit = 100): Promise<RetryResult> {
-    if (this.readOnly) {
-      throw new ReadOnlyError(`bulk retry failed jobs in queue ${queue}`);
-    }
-
-    const safeLimit = Math.max(1, Math.min(limit, 1000));
-    const failedKey = this.key(queue, "failed");
-    const waitKey = this.key(queue, "wait");
-    const ids = await this.client.zrange(failedKey, 0, safeLimit - 1);
-
-    if (ids.length === 0) {
-      return { queue, retried: 0, jobIds: [] };
-    }
-
-    await this.client.command("MULTI");
-    for (const jobId of ids) {
       const jobKey = this.key(queue, jobId);
+      const targetListKey = this.key(queue, pausedMeta === "1" ? "paused" : "wait");
+
+      await this.client.command("MULTI");
+      inTx = true;
       await this.client.command("ZREM", failedKey, jobId);
       await this.client.command(
         "HDEL",
@@ -317,15 +323,103 @@ export class BullMqBackend implements QueueBackend {
         "finishedOn",
         "returnvalue",
       );
-      await this.client.command("RPUSH", waitKey, jobId);
-    }
-    const execRes = await this.client.command("EXEC");
+      await this.client.command("RPUSH", targetListKey, jobId);
+      const execRes = await this.client.command("EXEC");
+      inTx = false;
 
-    if (execRes === null) {
-      return { queue, retried: 0, jobIds: [] };
+      if (execRes === null || !Array.isArray(execRes)) {
+        return { queue, retried: 0, jobIds: [] };
+      }
+      for (const entry of execRes) {
+        if (entry instanceof RespError) {
+          throw entry;
+        }
+      }
+      const removed = typeof execRes[0] === "number" ? execRes[0] : 0;
+      if (removed === 0) {
+        return { queue, retried: 0, jobIds: [] };
+      }
+
+      return { queue, retried: 1, jobIds: [jobId] };
+    } catch (err) {
+      if (inTx) {
+        await this.client.command("DISCARD").catch(() => undefined);
+      } else {
+        await this.client.command("UNWATCH").catch(() => undefined);
+      }
+      throw err;
+    }
+  }
+
+  async retryFailedBulk(queue: string, limit = 100): Promise<RetryResult> {
+    if (this.readOnly) {
+      throw new ReadOnlyError(`bulk retry failed jobs in queue ${queue}`);
     }
 
-    return { queue, retried: ids.length, jobIds: ids };
+    const safeLimit = clampLimit(limit, 100, 1000);
+    const failedKey = this.key(queue, "failed");
+    const metaKey = this.key(queue, "meta");
+
+    await this.client.command("WATCH", failedKey, metaKey);
+    let inTx = false;
+    try {
+      const [ids, pausedMeta] = await Promise.all([
+        this.client.zrange(failedKey, 0, safeLimit - 1),
+        this.client.hget(metaKey, "paused"),
+      ]);
+
+      if (ids.length === 0) {
+        await this.client.command("UNWATCH");
+        return { queue, retried: 0, jobIds: [] };
+      }
+
+      const targetListKey = this.key(queue, pausedMeta === "1" ? "paused" : "wait");
+
+      await this.client.command("MULTI");
+      inTx = true;
+      for (const jobId of ids) {
+        const jobKey = this.key(queue, jobId);
+        await this.client.command("ZREM", failedKey, jobId);
+        await this.client.command(
+          "HDEL",
+          jobKey,
+          "failedReason",
+          "stacktrace",
+          "processedOn",
+          "finishedOn",
+          "returnvalue",
+        );
+        await this.client.command("RPUSH", targetListKey, jobId);
+      }
+      const execRes = await this.client.command("EXEC");
+      inTx = false;
+
+      if (execRes === null || !Array.isArray(execRes)) {
+        return { queue, retried: 0, jobIds: [] };
+      }
+      for (const entry of execRes) {
+        if (entry instanceof RespError) {
+          throw entry;
+        }
+      }
+
+      const retriedIds: string[] = [];
+      for (let i = 0; i < ids.length; i++) {
+        const zremRes = execRes[i * 3];
+        if (typeof zremRes === "number" && zremRes > 0) {
+          retriedIds.push(ids[i]!);
+        }
+      }
+
+      return { queue, retried: retriedIds.length, jobIds: retriedIds };
+    } catch (err) {
+      if (inTx) {
+        await this.client.command("DISCARD").catch(() => undefined);
+      } else {
+        await this.client.command("UNWATCH").catch(() => undefined);
+      }
+      throw err;
+    }
   }
 
   async close(): Promise<void> {

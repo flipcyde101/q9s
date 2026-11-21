@@ -18,6 +18,20 @@ const ANSI = {
   white: "\x1b[37m",
 } as const;
 
+// Strip ANSI CSI, OSC, DCS/APC/PM, 2-byte ESC sequences, and C0/C1 control characters
+// so untrusted queue names, payloads, or DLQ error messages cannot spoof terminal UI.
+export function sanitizeTerminalText(raw: string): string {
+  return raw
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b[@-Z\\-_]/g, "")
+    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+}
+
+function sanitizeSingleLine(raw: string): string {
+  return sanitizeTerminalText(raw).replace(/[\r\n]+/g, " ");
+}
+
 function style(text: string, codes: string, enabled: boolean): string {
   return enabled ? `${codes}${text}${ANSI.reset}` : text;
 }
@@ -74,7 +88,8 @@ export function renderQueueTable(queues: ReadonlyArray<QueueStats>, options: Ren
   const headers = ["QUEUE", "BACKEND", "WAIT", "ACTIVE", "DELAYED", "DONE", "FAILED", "TREND"];
 
   const rows = queues.map((q) => {
-    const nameLabel = q.paused ? `${q.name} (paused)` : q.name;
+    const safeName = sanitizeSingleLine(q.name);
+    const nameLabel = q.paused ? `${safeName} (paused)` : safeName;
     const trend = renderSparkline(q.throughputHistory);
     return {
       raw: [
@@ -170,19 +185,20 @@ export function renderJobInspector(
 ): string {
   const color = options.color ?? false;
   const maxStackLines = options.maxStackLines ?? 6;
+  const safeQueue = sanitizeSingleLine(queueName);
   const countSuffix =
     totalInState !== undefined && totalInState > jobs.length
       ? ` (showing ${jobs.length} of ${totalInState} ${state} jobs)`
       : ` (${jobs.length} ${state} ${jobs.length === 1 ? "job" : "jobs"})`;
 
   const heading = style(
-    `DLQ / Job Inspector: ${queueName}${countSuffix}`,
+    `DLQ / Job Inspector: ${safeQueue}${countSuffix}`,
     `${ANSI.bold}${ANSI.white}`,
     color,
   );
 
   if (jobs.length === 0) {
-    return `${heading}\n  (no ${state} jobs found in "${queueName}")`;
+    return `${heading}\n  (no ${state} jobs found in "${safeQueue}")`;
   }
 
   const blocks = jobs.map((job, idx) => {
@@ -192,11 +208,11 @@ export function renderJobInspector(
         ? `${job.attemptsMade}/${job.maxAttempts}`
         : String(job.attemptsMade);
 
-    const jobHeader = `  #${idx + 1}  id=${job.id}  name=${job.name}  state=${job.state}  attempts=${attempts}`;
+    const jobHeader = `  #${idx + 1}  id=${sanitizeSingleLine(job.id)}  name=${sanitizeSingleLine(job.name)}  state=${job.state}  attempts=${attempts}`;
     lines.push(style(jobHeader, ANSI.bold, color));
 
     if (job.failedReason) {
-      lines.push(`      reason: ${style(job.failedReason, ANSI.red, color)}`);
+      lines.push(`      reason: ${style(sanitizeSingleLine(job.failedReason), ANSI.red, color)}`);
     }
 
     lines.push(
@@ -207,7 +223,7 @@ export function renderJobInspector(
       ),
     );
 
-    const prettyData = JSON.stringify(job.data ?? {}, null, 2)
+    const prettyData = sanitizeTerminalText(JSON.stringify(job.data ?? {}, null, 2))
       .split("\n")
       .map((line) => `        ${line}`)
       .join("\n");
@@ -219,7 +235,7 @@ export function renderJobInspector(
       const flatLines = job.stacktrace.flatMap((entry) => entry.split(/\r?\n/));
       const trimmed = flatLines.slice(0, maxStackLines);
       for (const traceLine of trimmed) {
-        lines.push(`        ${style(traceLine, ANSI.dim, color)}`);
+        lines.push(`        ${style(sanitizeSingleLine(traceLine), ANSI.dim, color)}`);
       }
       if (flatLines.length > maxStackLines) {
         lines.push(
@@ -238,10 +254,12 @@ export function renderDashboard(snapshot: DashboardSnapshot, options: RenderOpti
   const color = options.color ?? false;
   const badge = renderSafetyBadge(snapshot.readOnly, color);
   const title = style(`q9s v${snapshot.version}`, `${ANSI.bold}${ANSI.cyan}`, color);
+  const safeTarget = sanitizeSingleLine(snapshot.target);
+  const safeCtx = snapshot.contextName ? sanitizeSingleLine(snapshot.contextName) : undefined;
 
   const headerLines = [
     `${title}  ${badge}`,
-    `  target:  ${snapshot.target}${snapshot.contextName ? ` (ctx: ${snapshot.contextName})` : ""}`,
+    `  target:  ${safeTarget}${safeCtx ? ` (ctx: ${safeCtx})` : ""}`,
     `  backend: ${snapshot.backend}    captured: ${snapshot.capturedAt}`,
   ];
 

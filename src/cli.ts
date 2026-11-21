@@ -30,6 +30,22 @@ const VALID_STATES = new Set<JobState>([
 ]);
 
 const VALID_BACKENDS = new Set<QueueBackendKind>(["bullmq", "river", "pg-boss"]);
+const STRICT_UINT_RE = /^\d+$/;
+
+const VALUE_FLAGS = new Set([
+  "--ctx",
+  "--config",
+  "--backend",
+  "--prefix",
+  "--schema",
+  "--inspect",
+  "--queue",
+  "--state",
+  "--limit",
+  "--timeout",
+  "--retry",
+  "--retry-failed",
+]);
 
 export interface ParsedCliArgs {
   url?: string;
@@ -95,7 +111,7 @@ export function formatHelpText(): string {
     "  --retry <jobId>           Retry a single failed job (use with --inspect/--queue + --allow-write)",
     "  --queue <queue>           Target queue for --retry",
     "  --retry-failed <queue>    Bulk retry failed jobs in <queue> (requires --allow-write --yes)",
-    "  --yes                     Confirm bulk write operation",
+    "  -y, --yes                 Confirm bulk write operation",
     "",
     "Other:",
     "  -h, --help                Show this help message",
@@ -110,15 +126,38 @@ export function formatHelpText(): string {
   ].join("\n");
 }
 
-function readNextValue(argv: ReadonlyArray<string>, index: number, flag: string): string {
+function expandEqualsFlags(argv: ReadonlyArray<string>): string[] {
+  const expanded: string[] = [];
+  for (const arg of argv) {
+    if (arg.startsWith("--") && arg.includes("=")) {
+      const eqIdx = arg.indexOf("=");
+      const flag = arg.slice(0, eqIdx);
+      const val = arg.slice(eqIdx + 1);
+      if (VALUE_FLAGS.has(flag)) {
+        expanded.push(flag, val);
+        continue;
+      }
+    }
+    expanded.push(arg);
+  }
+  return expanded;
+}
+
+function readNextValue(
+  argv: ReadonlyArray<string>,
+  index: number,
+  flag: string,
+  allowLeadingDash = false,
+): string {
   const val = argv[index + 1];
-  if (val === undefined || val.startsWith("-")) {
+  if (val === undefined || val === "" || (!allowLeadingDash && val.startsWith("-"))) {
     throw new Error(`Option ${flag} requires a value.`);
   }
   return val;
 }
 
-export function parseCliArgs(argv: ReadonlyArray<string>): ParsedCliArgs {
+export function parseCliArgs(rawArgv: ReadonlyArray<string>): ParsedCliArgs {
+  const argv = expandEqualsFlags(rawArgv);
   const parsed: ParsedCliArgs = {
     listContexts: false,
     demo: false,
@@ -212,9 +251,12 @@ export function parseCliArgs(argv: ReadonlyArray<string>): ParsedCliArgs {
         break;
       }
       case "--limit": {
-        const raw = readNextValue(argv, i, arg);
-        const n = Number.parseInt(raw, 10);
-        if (!Number.isInteger(n) || n < 1) {
+        const raw = readNextValue(argv, i, arg, true);
+        if (!STRICT_UINT_RE.test(raw)) {
+          throw new Error(`Invalid --limit "${raw}". Expected a positive integer.`);
+        }
+        const n = Number(raw);
+        if (!Number.isSafeInteger(n) || n < 1) {
           throw new Error(`Invalid --limit "${raw}". Expected a positive integer.`);
         }
         parsed.limit = n;
@@ -222,9 +264,12 @@ export function parseCliArgs(argv: ReadonlyArray<string>): ParsedCliArgs {
         break;
       }
       case "--timeout": {
-        const raw = readNextValue(argv, i, arg);
-        const n = Number.parseInt(raw, 10);
-        if (!Number.isInteger(n) || n < 100) {
+        const raw = readNextValue(argv, i, arg, true);
+        if (!STRICT_UINT_RE.test(raw)) {
+          throw new Error(`Invalid --timeout "${raw}". Expected milliseconds >= 100.`);
+        }
+        const n = Number(raw);
+        if (!Number.isSafeInteger(n) || n < 100) {
           throw new Error(`Invalid --timeout "${raw}". Expected milliseconds >= 100.`);
         }
         parsed.timeoutMs = n;
@@ -232,7 +277,7 @@ export function parseCliArgs(argv: ReadonlyArray<string>): ParsedCliArgs {
         break;
       }
       case "--retry":
-        parsed.retryJobId = readNextValue(argv, i, arg);
+        parsed.retryJobId = readNextValue(argv, i, arg, true);
         i++;
         break;
       case "--retry-failed":
@@ -259,7 +304,7 @@ function detectProtocolKind(rawUrl: string): "redis" | "postgres" {
   try {
     parsed = new URL(rawUrl);
   } catch {
-    throw new Error(`Invalid target URL: ${rawUrl}`);
+    throw new Error(`Invalid target URL: ${redactUrl(rawUrl)}`);
   }
   if (parsed.protocol === "redis:" || parsed.protocol === "rediss:") {
     return "redis";
@@ -338,6 +383,18 @@ export async function runCli(
     return 2;
   }
 
+  const targetSelectorCount =
+    (args.demo ? 1 : 0) + (args.ctx ? 1 : 0) + (args.url ? 1 : 0);
+  if (targetSelectorCount > 1) {
+    writeError(
+      io,
+      args.json,
+      "Conflicting target selectors: specify only one of <url>, --ctx <name>, or --demo.",
+      "Q9S_USAGE_ERROR",
+    );
+    return 2;
+  }
+
   let targetUrl = args.url;
   let contextName: string | undefined;
   let backendHint = args.backend;
@@ -349,7 +406,7 @@ export async function runCli(
     try {
       const ctx = resolveContext(args.ctx, args.config);
       contextName = ctx.name;
-      targetUrl = targetUrl ?? ctx.url;
+      targetUrl = ctx.url;
       backendHint = backendHint ?? ctx.backend;
       prefix = prefix ?? ctx.prefix;
       schema = schema ?? ctx.schema;
@@ -404,6 +461,16 @@ export async function runCli(
     return 2;
   }
 
+  if (wantsRetrySingle && !(args.queue ?? args.inspect)) {
+    writeError(
+      io,
+      args.json,
+      "--retry requires a target queue via --queue <queue> or --inspect <queue>.",
+      "Q9S_USAGE_ERROR",
+    );
+    return 2;
+  }
+
   if (wantsRetryBulk && !args.yes) {
     writeError(
       io,
@@ -414,10 +481,11 @@ export async function runCli(
     return 2;
   }
 
-  const demoServer = args.demo ? await startMockRedisServer({ prefix: prefix ?? "bull" }) : null;
+  let demoServer: Awaited<ReturnType<typeof startMockRedisServer>> | null = null;
   let backend: QueueBackend | null = null;
 
   try {
+    demoServer = args.demo ? await startMockRedisServer({ prefix: prefix ?? "bull" }) : null;
     const effectiveUrl = demoServer ? demoServer.url : targetUrl!;
     const protocolKind = detectProtocolKind(effectiveUrl);
 
@@ -447,17 +515,7 @@ export async function runCli(
       : redactUrl(effectiveUrl);
 
     if (wantsRetrySingle) {
-      const targetQueue = args.queue ?? args.inspect;
-      if (!targetQueue) {
-        writeError(
-          io,
-          args.json,
-          "--retry requires a target queue via --queue <queue> or --inspect <queue>.",
-          "Q9S_USAGE_ERROR",
-        );
-        return 2;
-      }
-
+      const targetQueue = (args.queue ?? args.inspect)!;
       const result = await backend.retryJob(targetQueue, args.retryJobId!);
       if (args.json) {
         io.stdout(
@@ -534,7 +592,7 @@ export async function runCli(
     } else {
       const useColor =
         !args.noColor &&
-        process.env.NO_COLOR === undefined &&
+        !process.env.NO_COLOR &&
         Boolean(io.isTty);
       io.stdout(renderDashboard(snapshot, { color: useColor }));
     }
@@ -558,12 +616,13 @@ function isExecutedDirectly(): boolean {
   if (!entry) {
     return false;
   }
+  const normalize = (p: string) => (process.platform === "win32" ? p.toLowerCase() : p);
   try {
-    const currentFile = fs.realpathSync(fileURLToPath(import.meta.url));
-    const entryFile = fs.realpathSync(path.resolve(entry));
-    return currentFile === entryFile;
+    const currentFile = fs.realpathSync.native(fileURLToPath(import.meta.url));
+    const entryFile = fs.realpathSync.native(path.resolve(entry));
+    return normalize(currentFile) === normalize(entryFile);
   } catch {
-    return path.resolve(entry) === fileURLToPath(import.meta.url);
+    return normalize(path.resolve(entry)) === normalize(fileURLToPath(import.meta.url));
   }
 }
 

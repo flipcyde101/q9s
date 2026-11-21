@@ -146,7 +146,7 @@ describe("Postgres backend auto-detection and pure SQL parsers", () => {
     });
 
     expect(buildPgBossQueueStatsSql("pgboss")).toContain('"pgboss"."job"');
-    expect(buildPgBossJobsSql("pgboss", "billing-sync", "failed", 5)).toContain("state IN ('failed', 'expired', 'cancelled')");
+    expect(buildPgBossJobsSql("pgboss", "billing-sync", "failed", 5)).toContain("state IN ('failed', 'cancelled')");
     expect(buildPgBossRetryJobSql("pgboss", "billing-sync", jobId)).toContain(`id = '${jobId}'`);
   });
 });
